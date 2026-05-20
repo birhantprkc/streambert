@@ -210,9 +210,32 @@ function register(getMainWindow, { writeSecretMigration }) {
 
   ipcMain.handle("download-and-install-update", async (_, { url, format }) => {
     try {
-      const TRUSTED_PREFIX = "https://github.com/truelockmc/streambert/releases/download/";
-      const parsed = new URL(url);
-      if (!parsed.href.startsWith(TRUSTED_PREFIX)) {
+
+      const ALLOWED_FORMATS = ["exe", "deb", "pacman", "dmg", "dmg_arm64", "appimage"];
+      if (!ALLOWED_FORMATS.includes(format)) {
+        return { ok: false, error: "Invalid format" };
+      }
+
+      const TRUSTED_ORIGIN   = "https://github.com";
+      const TRUSTED_PATH     = "/truelockmc/streambert/releases/download/";
+      // Domains that are allowed as redirect targets (GitHub CDN).
+      const ALLOWED_REDIRECT_HOSTS = [
+        "github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+      ];
+
+      let parsed;
+      try {
+        parsed = new URL(url);
+      } catch {
+        return { ok: false, error: "Invalid URL" };
+      }
+
+      if (
+        parsed.origin !== TRUSTED_ORIGIN ||
+        !parsed.pathname.startsWith(TRUSTED_PATH)
+      ) {
         return { ok: false, error: "Unauthorized update source" };
       }
 
@@ -230,7 +253,23 @@ function register(getMainWindow, { writeSecretMigration }) {
       await new Promise((resolve, reject) => {
         if (signal.aborted) return reject(new Error("Cancelled"));
 
-        const doRequest = (reqUrl) => {
+        const doRequest = (reqUrl, redirectDepth = 0) => {
+          // Guard against infinite redirect loops.
+          if (redirectDepth > 5) {
+            return reject(new Error("Too many redirects"));
+          }
+          let reqParsed;
+          try {
+            reqParsed = new URL(reqUrl);
+          } catch {
+            return reject(new Error("Invalid redirect URL"));
+          }
+          if (!ALLOWED_REDIRECT_HOSTS.includes(reqParsed.hostname)) {
+            return reject(
+              new Error(`Untrusted redirect host: ${reqParsed.hostname}`)
+            );
+          }
+
           const lib = reqUrl.startsWith("https") ? https : http;
           const req = lib.get(
             reqUrl,
@@ -247,11 +286,10 @@ function register(getMainWindow, { writeSecretMigration }) {
                 res.headers.location
               ) {
                 res.resume();
-                doRequest(
-                  res.headers.location.startsWith("http")
-                    ? res.headers.location
-                    : new URL(res.headers.location, reqUrl).toString(),
-                );
+                const next = res.headers.location.startsWith("http")
+                  ? res.headers.location
+                  : new URL(res.headers.location, reqUrl).toString();
+                doRequest(next, redirectDepth + 1);
                 return;
               }
               if (res.statusCode !== 200) {
